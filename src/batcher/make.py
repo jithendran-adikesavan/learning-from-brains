@@ -75,7 +75,8 @@ def make_batcher(
     sample_keys = [
         'inputs',
         'attention_mask',
-        't_rs'
+        't_rs',
+	'__key__'
     ]
     if training_style in {'BERT', 'NetBERT'}:
         sample_keys.extend(

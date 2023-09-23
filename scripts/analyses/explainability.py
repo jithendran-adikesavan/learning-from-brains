@@ -1,153 +1,134 @@
-#!/usr/bin/env python3
-
-"""
-train.py
-
-Training of models on given data. See get_args() for 
-details on command line arguments.
-
-To train a model, multiple core components from ..src/ 
-are invoked:
-
-src/batcher: Building PyTorch dataloaders for given data.
-src/embedder: Embedding of inputs into embedding space, 
-    training-style specific addition of training tokens
-    and masking, and computation of training-style specific 
-    losses.
-    Valid training styles:
-        - CSM (Causal Sequence Modeling)
-        - BERT (Sequence-BERT)
-        - NetBERT (Network-BERT)
-        - autoencoder
-        - decoding
-src/decoder: Model architecture used for decoding / sequence modeling. 
-    One of the following:
-        - GPT
-        - BERT
-        - NetBERT
-        - autoencoder
-        - LinearBaseline
-        - PretrainedGPT2 (as provided by HuggingFace)
-        - PretrainedBERT (as provided by HuggingFace)
-src/unembedder: Projecting sequence output of decoder back 
-    to input space.
-src/trainer: Trainer for model; invokes instance of 
-    Hugging Face's Trainer object.
-src/model: Build full model from components (ie., embedder, 
-    decoder, unembedder). See make_model() below for details.
-"""
-
-import os
+# -*- coding: UTF-8 -*-
 import argparse
-from typing import Dict
 import json
-from datetime import datetime
-from numpy import random
-import pandas as pd
-import numpy as np
-from torch import manual_seed
+import logging
+import os
 import sys
+from datetime import datetime
+from typing import Dict
+
+import numpy as np
+import pandas as pd
+import torch
+from nilearn.datasets import fetch_atlas_difumo
+from nilearn.regions import signals_to_img_maps
+from numpy import random
+from torch import manual_seed
+from torch.utils.data import Dataset
+
 script_path = os.path.dirname(os.path.realpath(__file__))
-sys.path.insert(0, os.path.join(script_path, '../'))
+sys.path.insert(0, f'{script_path}/../')
+from train import make_model, make_trainer
+import src.tools as tools
+
+sys.path.insert(0, f'{script_path}/../../')
 from src.batcher import make_batcher
-from src.decoder import make_decoder
-from src.embedder import make_embedder
-from src.trainer import make_trainer, Trainer
-from src.unembedder import make_unembedder
-from src.model import Model
-from src import tools
+from src.tools import plot_brain_map
+
+__author__ = "jadikesavan1@sheffield.ac.uk"
+LOGGER = logging.getLogger(name=__name__)
+logging.basicConfig(level=logging.INFO)
 
 
-def train(config: Dict=None) -> Trainer:
-    """Model training according to config.
-        -> see get_args() below for all command 
-        line arguments.
+def get_config(args: argparse.Namespace = None) -> Dict:
     """
-    
+    Make config from command line arguments (as created by get_args()).
+    Performs additional formating of args required for calling train().
+    """
+
+    if args is None:
+        args = get_args().parse_args()
+
+    if args.smoke_test == "True":
+        args.per_device_training_batch_size = 2
+        args.per_device_validation_batch_size = 2
+        args.training_steps = 2
+        args.validation_steps = 2
+        args.test_steps = 2
+        args.log_every_n_steps = 1
+
+    if args.num_attention_heads == -1:
+        assert (
+                       args.embedding_dim % 64
+               ) == 0, f'embedding-dim needs be be multiple of 64 (currently: {args.embedding_dim})'
+        args.num_attention_heads = args.embedding_dim // 64
+
+    if args.run_name == 'none':
+        args.run_name = f'{args.architecture}'
+
+        if args.architecture != 'LinearBaseline':
+
+            if 'Pretrained' not in args.architecture:
+                args.run_name += f'_lrs-{args.num_hidden_layers}'
+
+                if args.architecture != 'autoencoder':
+                    args.run_name += f'_hds-{args.num_attention_heads}'
+
+            args.run_name += f'_embd-{args.embedding_dim}'
+            args.run_name += f'_train-{args.training_style}'
+            args.run_name += f'_lr-{str(args.learning_rate).replace(".", "")[1:]}'
+            args.run_name += f'_bs-{args.per_device_training_batch_size}'
+            args.run_name += f'_drp-{str(args.dropout).replace(".", "")}'
+
+            if args.training_style not in {'decoding', 'autoencoder', 'CSM'}:
+                args.run_name += f'_msk-{str(args.masking_rate).replace(".", "")}'
+
+        else:
+            args.run_name += f'_train-{args.training_style}'
+
+        args.run_name += f"_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+
+    if args.smoke_test == "True":
+        args.run_name = f'smoke-test_{args.run_name}'
+
+    args.log_dir = os.path.join(args.log_dir, args.run_name)
+    args.wandb_mode = args.wandb_mode if args.wandb_mode in {'online', 'offline'} and args.local_rank in {-1,
+                                                                                                          0} else "disabled"
+
+    config = vars(args)
+
+    for arg in config:
+
+        if config[arg] in {'True', 'False'}:
+            config[arg] = config[arg] == 'True'
+
+        elif config[arg] == 'none':
+            config[arg] = None
+
+        elif 'subjects_per_dataset' in arg:
+            config[arg] = None if config[arg] == -1 else config[arg]
+
+    return config
+
+
+def identify_roi(config: Dict = None) -> None:
+    """Script's main function; computes brain map for
+    reconstruction error of given upstream model in upstream
+    validation data"""
+
     if config is None:
         config = get_config()
 
-    if config['do_train']:
-        os.makedirs(
-            config["log_dir"],
-            exist_ok=True
-        )
+    random.seed(config["seed"])
+    manual_seed(config["seed"])
 
-        resume_path = str(config["resume_from"]) if config["resume_from"] is not None else None
-        
-        if resume_path is not None:
-            config_filepath = os.path.join(
-                config["resume_from"],
-                'train_config.json'
-            )
+    batcher = make_batcher(
+        training_style=config["training_style"],
+        sample_random_seq=config["sample_random_seq"],
+        seq_min=config["seq_min"],
+        seq_max=config["seq_max"],
+        bert_seq_gap_min=config["bert_seq_gap_min"],
+        bert_seq_gap_max=config["bert_seq_gap_max"],
+        decoding_target=config["decoding_target"],
+        bold_dummy_mode=config["bold_dummy_mode"]
+    )
 
-            if os.path.isfile(config_filepath):
-                print(
-                    f'Loading training config from {config_filepath}'
-                )
-
-                with open(config_filepath, 'r') as f:
-                    config = json.load(f)
-
-            else:
-
-                with open(config_filepath, 'w') as f:
-                    json.dump(config, f, indent=2)
-            
-            checkpoints = [
-                int(p.split('checkpoint-')[1])
-                for p in os.listdir(resume_path)
-                if 'checkpoint-' in p
-                and os.path.isdir(os.path.join(resume_path, p))
-            ]
-            last_checkpoint = max(checkpoints)
-            print(
-                f'Resuming training from checkpoint-{last_checkpoint} in {resume_path}'
-            )
-            config["resume_from"] = os.path.join(
-                resume_path,
-                f'checkpoint-{last_checkpoint}'
-            )
-
-        else:
-            config_filepath = os.path.join(
-                config["log_dir"],
-                'train_config.json'
-            )
-            
-            with open(config_filepath, 'w') as f:
-                json.dump(config, f, indent=2)
-
-            config["resume_from"] = None
-
-    assert config["training_style"] in {
-        'BERT',
-        'CSM',
-        'NetBERT',
-        'autoencoder',
-        'decoding'
-    }, f'{config["training_style"]} is not supported.'
-    
-    assert config["architecture"] in {
-        'BERT',
-        'NetBERT',
-        'GPT',
-        'autoencoder',
-        'PretrainedGPT2',
-        'PretrainedBERT',
-        'LinearBaseline'
-    }, f'{config["architecture"]} is not supported.'
-    
     path_tarfile_paths_split = os.path.join(
         config["log_dir"],
         'tarfile_paths_split.json'
     )
 
-    if config['set_seed']:
-        random.seed(config["seed"])
-        manual_seed(config["seed"])
-
-    if not os.path.isfile(path_tarfile_paths_split): 
+    if not os.path.isfile(path_tarfile_paths_split):
         tarfile_paths = tools.data.grab_tarfile_paths(config["data"])
         tarfile_paths_split = tools.data.split_tarfile_paths_train_val(
             tarfile_paths=tarfile_paths,
@@ -160,6 +141,10 @@ def train(config: Dict=None) -> Trainer:
         print(
             f'Saving tarfile split to {path_tarfile_paths_split}'
         )
+
+        parent_dir = os.path.abspath(os.path.join(path_tarfile_paths_split, os.pardir))
+        if not os.path.isdir(parent_dir):
+            os.mkdir(parent_dir)
 
         with open(path_tarfile_paths_split, 'w') as f:
             json.dump(tarfile_paths_split, f, indent=2)
@@ -175,49 +160,39 @@ def train(config: Dict=None) -> Trainer:
     train_tarfile_paths = tarfile_paths_split['train']
     validation_tarfile_paths = tarfile_paths_split['validation']
     test_tarfile_paths = tarfile_paths_split['test'] if 'test' in tarfile_paths_split else None
-    
+
     assert all(
         os.path.isfile(f) for f in train_tarfile_paths
     ), f'Some of the training tarfiles in {path_tarfile_paths_split} do not exist.'
-    
+
     assert all(
         os.path.isfile(f) for f in validation_tarfile_paths
     ), f'Some of the validation tarfiles in {path_tarfile_paths_split} do not exist.'
-    
+
     if test_tarfile_paths is not None:
         assert all(
             os.path.isfile(f) for f in test_tarfile_paths
         ), f'Some of the test tarfiles in {path_tarfile_paths_split} do not exist.'
 
-    batcher = make_batcher(
-        training_style=config["training_style"],
-        sample_random_seq=config["sample_random_seq"],
-        seq_min=config["seq_min"],
-        seq_max=config["seq_max"],
-        bert_seq_gap_min=config["bert_seq_gap_min"],
-        bert_seq_gap_max=config["bert_seq_gap_max"],
-        decoding_target=config["decoding_target"],
-        bold_dummy_mode=config["bold_dummy_mode"]
-    )
     train_dataset = batcher.dataset(
         tarfiles=train_tarfile_paths,
-        length=config["training_steps"]*config["per_device_training_batch_size"]
+        length=config["training_steps"] * config["per_device_training_batch_size"]
     )
     validation_dataset = batcher.dataset(
         tarfiles=validation_tarfile_paths,
-        length=config["validation_steps"]*config["per_device_validation_batch_size"]
+        length=config["validation_steps"] * config["per_device_validation_batch_size"]
     )
 
     if test_tarfile_paths is not None:
         test_dataset = batcher.dataset(
             tarfiles=test_tarfile_paths,
-            length=config["test_steps"]*config["per_device_validation_batch_size"]
+            length=config["test_steps"] * config["per_device_validation_batch_size"]
         )
-    
+
     else:
         test_dataset = None
 
-    def model_init(params: Dict=None):
+    def model_init(params: Dict = None):
         model_config = dict(config)
 
         if params is not None:
@@ -231,8 +206,9 @@ def train(config: Dict=None) -> Trainer:
             entity='athms',
             run_id=config["run_name"],
             project=config["wandb_project_name"],
-            mode=config["wandb_mode"]
+            mode='none'
         )
+    config["pretrained_model"] = os.path.join(config["model_dir"], "model_final", "pytorch_model.bin")
 
     trainer = make_trainer(
         model_init=model_init,
@@ -262,16 +238,6 @@ def train(config: Dict=None) -> Trainer:
         deepspeed=config["deepspeed"],
     )
 
-    if config["plot_model_graph"]:
-        tools.visualize.plot_model_graph(
-            model=trainer.model,
-            dataloader=trainer.get_train_dataloader(),
-            path=os.path.join(
-                config["log_dir"],
-                'model_graph'
-            )
-        )
-
     if config['do_train']:
         trainer.train(resume_from_checkpoint=config["resume_from"])
         trainer.save_model(
@@ -280,7 +246,7 @@ def train(config: Dict=None) -> Trainer:
                 'model_final'
             )
         )
-
+    model = trainer.model
     if test_dataset is not None:
         test_prediction = trainer.predict(test_dataset)
         pd.DataFrame(
@@ -308,164 +274,91 @@ def train(config: Dict=None) -> Trainer:
             test_prediction.label_ids
         )
 
-    return trainer
-
-
-def make_model(model_config: Dict=None):
-    """Make model from model_config 
-    (as generated by get_config()).
-    """
-    embedder = make_embedder(
-        training_style=model_config["training_style"],
-        architecture=model_config["architecture"],
-        in_dim=model_config["parcellation_dim"],
-        embed_dim=model_config["embedding_dim"],
-        num_hidden_layers=model_config["num_hidden_layers_embedding_model"],
-        dropout=model_config["dropout"],
-        t_r_precision=model_config["tr_precision"],
-        max_t_r=model_config["tr_max"],
-        masking_rate=model_config["masking_rate"],
-        n_positions=model_config["n_positions"]
+    os.makedirs(
+        config['error_brainmaps_dir'],
+        exist_ok=True
     )
-    decoder = make_decoder(
-        architecture=model_config["architecture"],
-        num_hidden_layers=model_config["num_hidden_layers"],
-        embed_dim=model_config["embedding_dim"],
-        num_attention_heads=model_config["num_attention_heads"],
-        n_positions=model_config["n_positions"],
-        intermediate_dim_factor=model_config["intermediate_dim_factor"],
-        hidden_activation=model_config["hidden_activation"],
-        dropout=model_config["dropout"],
-        autoen_teacher_forcing_ratio=model_config["autoen_teacher_forcing_ratio"],
+    path_model_config = os.path.join(
+        config["model_dir"],
+        'train_config.json'
+    )
+    path_tarfile_paths_split = os.path.join(
+        config["model_dir"],
+        'tarfile_paths_split.json'
+    )
+    path_pretrained_model = os.path.join(
+        config["model_dir"],
+        'model_final',
+        "pytorch_model.bin"
     )
 
-    if model_config["embedding_dim"] != model_config["parcellation_dim"]:
-        unembedder = make_unembedder(
-            embed_dim=model_config["embedding_dim"],
-            num_hidden_layers=model_config["num_hidden_layers_unembedding_model"],
-            out_dim=model_config["parcellation_dim"],
-            dropout=model_config["dropout"],
+    assert os.path.isfile(path_model_config), \
+        f'{path_model_config} does not exist'
+    assert os.path.isfile(path_tarfile_paths_split), \
+        f'{path_tarfile_paths_split} does not exist'
+    assert os.path.isfile(path_pretrained_model), \
+        f'{path_pretrained_model} does not exist'
+
+    with open(path_model_config, 'r') as f:
+        model_config = json.load(f)
+
+    path_error_map = os.path.join(
+        config['error_brainmaps_dir'],
+        f'mean_eval_error_{model_config["training_style"]}.nii.gz'
+    )
+
+    eval_dataloader = torch.utils.data.DataLoader(
+        validation_dataset,
+        batch_size=1
+    )
+
+    if config["plot_model_graph"]:
+        # Plot the weights on the brain atlas
+        difumo = fetch_atlas_difumo(
+            dimension=1024,
+            resolution_mm=2
         )
 
-    else:
-        unembedder = None
+        for batch_i, batch in enumerate(eval_dataloader):
+            LOGGER.info(
+                f'\tprocessing sample {batch_i} / {config["n_eval_samples"]}'
+            )
+            img_name = batch["__key__"][0][0]
+            batch = {k: v[0] for k, v in batch.items() if '__key__' != k}
 
-    model = Model(
-        embedder=embedder,
-        decoder=decoder,
-        unembedder=unembedder
-    )
+            logits, ret_batch = model.forward(batch, return_batch=True)
 
-    if model_config["training_style"] == 'decoding':
-        model.switch_decoding_mode(
-            is_decoding_mode=True,
-            num_decoding_classes=model_config["num_decoding_classes"]
-        )
+            for i in range(0, ret_batch["inputs"][0].shape[0]):
+                par_dir = os.path.join(config['error_brainmaps_dir'], img_name)
 
-    if model_config["pretrained_model"] is not None:
-        model.from_pretrained(model_config["pretrained_model"])
+                if not os.path.isdir(par_dir):
+                    os.mkdir(par_dir)
 
-    if model_config["freeze_embedder"]:
-        for param in model.embedder.parameters():
-            param.requires_grad = False
+                error_img_map = signals_to_img_maps(
+                    region_signals=ret_batch["inputs_embeds"][0][i],
+                    maps_img=difumo.maps
+                )
+                error_img_map.to_filename(os.path.join(par_dir, img_name) + f"_{str(i)}")
 
-    if model_config["freeze_decoder"]:
-        for param in model.decoder.parameters():
-            param.requires_grad = False
-
-    if 'freeze_decoder_without_pooler_heads' in model_config \
-        and model_config["freeze_decoder_without_pooler_heads"]:
-        for name, param in model.decoder.named_parameters():
-            if 'pooler_layer' in name \
-            or 'decoding_head' in name \
-            or 'is_next_head' in name:
-                continue
-            else:
-                param.requires_grad = False
-
-    if model_config["freeze_unembedder"] and unembedder is not None:
-        for param in model.unembedder.parameters():
-            param.requires_grad = False
-
-    return model
-
-
-
-def get_config(args: argparse.Namespace=None) -> Dict:
-    """
-    Make config from command line arguments (as created by get_args()).
-    Performs additional formating of args required for calling train().
-    """
-
-    if args is None:
-        args = get_args().parse_args()
-
-    if args.smoke_test == "True":
-        args.per_device_training_batch_size =  2
-        args.per_device_validation_batch_size = 2
-        args.training_steps = 2
-        args.validation_steps = 2
-        args.test_steps = 2
-        args.log_every_n_steps = 1
-
-    if args.num_attention_heads == -1:
-        assert (
-            args.embedding_dim%64
-         ) == 0, f'embedding-dim needs be be multiple of 64 (currently: {args.embedding_dim})' 
-        args.num_attention_heads = args.embedding_dim//64
-
-    if args.run_name == 'none':
-        args.run_name = f'{args.architecture}'
-
-        if args.architecture != 'LinearBaseline':
-            
-            if 'Pretrained' not in args.architecture:
-                args.run_name += f'_lrs-{args.num_hidden_layers}'
-
-                if args.architecture != 'autoencoder':
-                    args.run_name += f'_hds-{args.num_attention_heads}'
-
-            args.run_name += f'_embd-{args.embedding_dim}'
-            args.run_name += f'_train-{args.training_style}'
-            args.run_name += f'_lr-{str(args.learning_rate).replace(".", "")[1:]}'
-            args.run_name += f'_bs-{args.per_device_training_batch_size}'
-            args.run_name += f'_drp-{str(args.dropout).replace(".", "")}'
-
-            if args.training_style not in {'decoding', 'autoencoder', 'CSM'}:
-                args.run_name += f'_msk-{str(args.masking_rate).replace(".", "")}'
-
-        else:
-            args.run_name += f'_train-{args.training_style}'
-
-        args.run_name += f"_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-
-    if args.smoke_test == "True":
-        args.run_name = f'smoke-test_{args.run_name}'
-
-    args.log_dir = os.path.join(args.log_dir, args.run_name)
-    args.wandb_mode = args.wandb_mode if args.wandb_mode in {'online', 'offline'} and args.local_rank in {-1, 0} else "disabled"
-    
-    config = vars(args)
-
-    for arg in config:
-        
-        if config[arg] in {'True', 'False'}:
-            config[arg] = config[arg] == 'True'
-        
-        elif config[arg] == 'none':
-            config[arg] = None
-
-        elif 'subjects_per_dataset' in arg:
-            config[arg] = None if config[arg] == -1 else config[arg]
-
-    return config
+                try:
+                    plot_brain_map(
+                        img=error_img_map,
+                        path=os.path.join(
+                            par_dir,
+                            f'mean_eval_error_{model_config["training_style"]}_{img_name}_{str(i)}.png'
+                        ),
+                        vmin=np.min(error_img_map.get_fdata()),
+                        vmax=0.0035,
+                    )
+                except Exception as exc:
+                    continue
+    return None
 
 
 def get_args() -> argparse.ArgumentParser:
-    """Get command line arguments"""
-
     parser = argparse.ArgumentParser(
-        description='run model training'
+        description='compute upstream reconstruction error brain map for given model; '
+                    'as shown in appendix figure 2 of the manuscript.'
     )
 
     # Data pipeline settings:
@@ -494,7 +387,7 @@ def get_args() -> argparse.ArgumentParser:
         help='number of subjects per dataset that are '
              'randomly selected as validation data. '
              '! overrides --frac-val-per-dataset and '
-             'requires setting --n-train-subjects-per-dataset' 
+             'requires setting --n-train-subjects-per-dataset'
     )
     parser.add_argument(
         '--n-test-subjects-per-dataset',
@@ -513,7 +406,7 @@ def get_args() -> argparse.ArgumentParser:
         help='number of subjects per dataset that are '
              'randomly selected as training data. '
              '! overrides --frac-val-per-dataset and '
-             'requires setting --n-val-subjects-per-dataset' 
+             'requires setting --n-val-subjects-per-dataset'
     )
     parser.add_argument(
         '--parcellation-dim',
@@ -524,7 +417,7 @@ def get_args() -> argparse.ArgumentParser:
              '! This is fixed for the current up-/downstream data.'
     )
     parser.add_argument(
-        '--pretrained-model',
+        '--model-dir',
         metavar='DIR',
         type=str,
         default='none',
@@ -532,8 +425,7 @@ def get_args() -> argparse.ArgumentParser:
              '(default: none)'
     )
 
-
-    # Embedder settings:    
+    # Embedder settings:
     parser.add_argument(
         '--embedding-dim',
         metavar='INT',
@@ -578,7 +470,6 @@ def get_args() -> argparse.ArgumentParser:
              '(default: False) '
     )
 
-
     # UnEmbedder settings:
     parser.add_argument(
         '--num-hidden-layers-unembedding-model',
@@ -597,7 +488,6 @@ def get_args() -> argparse.ArgumentParser:
         help='whether or not to freeze unembedder weights during training '
              '(default: False) '
     )
-
 
     # Decoder settings:
     parser.add_argument(
@@ -691,8 +581,6 @@ def get_args() -> argparse.ArgumentParser:
              ' is-next-pred / decoding heads '
              '(default: False) '
     )
-
-    
 
     # Trainer settings:
     parser.add_argument(
@@ -924,7 +812,6 @@ def get_args() -> argparse.ArgumentParser:
              '(default: 0.5)'
     )
 
-    
     # Logging settings:
     parser.add_argument(
         '--log-dir',
@@ -968,11 +855,10 @@ def get_args() -> argparse.ArgumentParser:
         '--wandb-project-name',
         metavar='STR',
         type=str,
-        default='learning-from-brains',
+        default='learning-from-brains-master',
         help='name of wandb project where data is logged '
-             '(default: learning-from-brains)'
+             '(default: learning-from-brains-master)'
     )
-    
 
     # Other settings:
     parser.add_argument(
@@ -994,7 +880,7 @@ def get_args() -> argparse.ArgumentParser:
         '--fp16',
         metavar='BOOL',
         choices=('True', 'False'),
-        default='True',
+        default='False',
         help='whether or not to use 16-bit precision GPU training '
              '(default: True)'
     )
@@ -1069,9 +955,27 @@ def get_args() -> argparse.ArgumentParser:
              'If "False", train() still returns trainer'
     )
 
+    ## XAI
+    parser.add_argument(
+        '--error-brainmaps-dir',
+        metavar='DIR',
+        default='results/brain_maps/l1_error',
+        type=str,
+        help='directory to which error brain map will be stored '
+             '(default: results/brain_maps/l1_error)'
+    )
+    parser.add_argument(
+        '--n-eval-samples',
+        metavar='N',
+        default=50000,
+        type=int,
+        help='number of random samples to draw for evaluation '
+             '(default: 50000)'
+    )
+
     return parser
 
 
 if __name__ == '__main__':
+    identify_roi()
 
-    trainer = train()

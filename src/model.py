@@ -190,6 +190,8 @@ class Model(torch.nn.Module):
         else:
             assert 'inputs_embeds' in batch, 'inputs_embeds not in batch'
 
+        data = batch["inputs_embeds"]
+
         batch['inputs_embeds'] = self.embedder(batch=batch)
         outputs = self.decoder(batch=batch)
         
